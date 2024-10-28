@@ -1,7 +1,10 @@
 #version 450
 
+#extension GL_EXT_debug_printf : enable
+
 layout (set = 0, binding = 1) uniform texture2D textureColor;
 layout (set = 0, binding = 2) uniform sampler samplers[3];
+layout (set = 0, binding = 3, R32f) uniform readonly image2DArray textureColorLevel;
 
 layout (location = 0) in vec2 inUV;
 layout (location = 1) in float inLodBias;
@@ -23,7 +26,15 @@ layout (location = 0) out vec4 outFragColor;
 
 void main() 
 {
+	ivec2 size = imageSize(textureColorLevel).xy;
+	if (gl_FragCoord.xy == vec2(0.5, 0.5)) {
+		debugPrintfEXT("test123 %d %d\n", size.x, size.y);
+	}
+
 	vec4 color = texture(sampler2D(textureColor, samplers[ubo.samplerIndex]), inUV, inLodBias);
+	if (size.x != 128) {
+		color = vec4(0, 0, 0, 0);
+	}
 
 	vec3 N = normalize(inNormal);
 	vec3 L = normalize(inLightVec);

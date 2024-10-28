@@ -13,6 +13,20 @@
 #include <ktx.h>
 #include <ktxvulkan.h>
 
+#ifdef _MSC_VER
+// see https://stackoverflow.com/a/23616164
+int setenv(const char *name, const char *value, int overwrite)
+{
+	int errcode = 0;
+	if(!overwrite) {
+		size_t envsize = 0;
+		errcode = getenv_s(&envsize, NULL, 0, name);
+		if(errcode || envsize) return errcode;
+	}
+	return _putenv_s(name, value);
+}
+#endif
+
 class VulkanExample : public VulkanExampleBase
 {
 public:
@@ -20,11 +34,12 @@ public:
 		VkImage image{ VK_NULL_HANDLE };
 		VkDeviceMemory deviceMemory{ VK_NULL_HANDLE };
 		VkImageView view{ VK_NULL_HANDLE };
+		VkImageView view_mipmap_level{ VK_NULL_HANDLE };
 		uint32_t width{ 0 };
 		uint32_t height{ 0 };
 		uint32_t mipLevels{ 0 };
 	} texture;
-
+ 
 	// To demonstrate mip mapping and filtering this example uses separate samplers
 	std::vector<std::string> samplerNames{ "No mip maps" , "Mip maps (bilinear)" , "Mip maps (anisotropic)" };
 	std::vector<VkSampler> samplers{};
@@ -56,6 +71,15 @@ public:
 		camera.movementSpeed = 2.5f;
 		camera.rotationSpeed = 0.5f;
 		timerSpeed *= 0.05f;
+
+		// SRS - Force validation on since debugPrintfEXT provided by VK_LAYER_KHRONOS_validation on macOS
+		settings.validation = true;
+		setenv("VK_LAYER_ENABLES", "VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT", 1);
+
+		// Using printf requires the non semantic info extension to be enabled
+		enabledDeviceExtensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+
+		setenv("VK_KHRONOS_VALIDATION_PRINTF_TO_STDOUT", "1", 1);
 	}
 
 	~VulkanExample()
@@ -161,7 +185,7 @@ public:
 		imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 		imageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		imageCreateInfo.extent = { texture.width, texture.height, 1 };
-		imageCreateInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageCreateInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
 		VK_CHECK_RESULT(vkCreateImage(device, &imageCreateInfo, nullptr, &texture.image));
 		vkGetImageMemoryRequirements(device, texture.image, &memReqs);
 		memAllocInfo.allocationSize = memReqs.size;
@@ -296,7 +320,7 @@ public:
 			VK_ACCESS_TRANSFER_READ_BIT,
 			VK_ACCESS_SHADER_READ_BIT,
 			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_IMAGE_LAYOUT_GENERAL,
 			VK_PIPELINE_STAGE_TRANSFER_BIT,
 			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			subresourceRange);
@@ -338,6 +362,7 @@ public:
 		VK_CHECK_RESULT(vkCreateSampler(device, &sampler, nullptr, &samplers[2]));
 
 		// Create image view
+		{
 		VkImageViewCreateInfo view = vks::initializers::imageViewCreateInfo();
 		view.image = texture.image;
 		view.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -348,12 +373,30 @@ public:
 		view.subresourceRange.layerCount = 1;
 		view.subresourceRange.levelCount = texture.mipLevels;
 		VK_CHECK_RESULT(vkCreateImageView(device, &view, nullptr, &texture.view));
+		}
+
+		{
+			const unsigned int baseMipmapLevel = 2;
+
+			VkImageViewCreateInfo view = vks::initializers::imageViewCreateInfo();
+			view.image = texture.image;
+			view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+			view.format = VK_FORMAT_R8G8B8A8_UNORM;
+			view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			view.subresourceRange.baseMipLevel = baseMipmapLevel;
+			view.subresourceRange.levelCount = texture.mipLevels - baseMipmapLevel;
+			view.subresourceRange.baseArrayLayer = 0;
+			view.subresourceRange.layerCount = 1;
+			VkImageView mipmap_level_image_view = {};
+			VK_CHECK_RESULT(vkCreateImageView(device, &view, nullptr, &texture.view_mipmap_level));
+		}
 	}
 
 	// Free all Vulkan resources used a texture object
 	void destroyTextureImage(Texture texture)
 	{
 		vkDestroyImageView(device, texture.view, nullptr);
+		vkDestroyImageView(device, texture.view_mipmap_level, nullptr);
 		vkDestroyImage(device, texture.image, nullptr);
 		vkFreeMemory(device, texture.deviceMemory, nullptr);
 	}
@@ -427,6 +470,7 @@ public:
 			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT, 1),
 			// Binding 2: Array with 3 samplers
 			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 2, 3),
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_SHADER_STAGE_FRAGMENT_BIT, 3),
 		};
 		VkDescriptorSetLayoutCreateInfo descriptorLayout = vks::initializers::descriptorSetLayoutCreateInfo(setLayoutBindings);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorLayout, nullptr, &descriptorSetLayout));
@@ -435,7 +479,7 @@ public:
 		VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayout, 1);
 		VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet));
 
-		VkDescriptorImageInfo textureDescriptor = vks::initializers::descriptorImageInfo(VK_NULL_HANDLE, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		VkDescriptorImageInfo textureDescriptor = vks::initializers::descriptorImageInfo(VK_NULL_HANDLE, texture.view, VK_IMAGE_LAYOUT_GENERAL);
 		std::vector<VkWriteDescriptorSet> writeDescriptorSets = {
 			// Binding 0: Vertex shader uniform buffer
 			vks::initializers::writeDescriptorSet(descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &uniformBuffer.descriptor),
@@ -446,7 +490,7 @@ public:
 		// Binding 2: Contains an array of samplers that can be switched from the UI to demonstrate different filteirng modes
 		std::vector<VkDescriptorImageInfo> samplerDescriptors;
 		for (auto i = 0; i < samplers.size(); i++) {
-			samplerDescriptors.push_back(vks::initializers::descriptorImageInfo(samplers[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+			samplerDescriptors.push_back(vks::initializers::descriptorImageInfo(samplers[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL));
 		}
 		VkWriteDescriptorSet samplerDescriptorWrite{};
 		samplerDescriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -457,6 +501,11 @@ public:
 		samplerDescriptorWrite.dstBinding = 2;
 		samplerDescriptorWrite.dstArrayElement = 0;
 		writeDescriptorSets.push_back(samplerDescriptorWrite);
+
+		// Binding 3:
+		VkDescriptorImageInfo mipmapLevelDescriptor = vks::initializers::descriptorImageInfo(VK_NULL_HANDLE, texture.view_mipmap_level, VK_IMAGE_LAYOUT_GENERAL);
+		writeDescriptorSets.push_back(vks::initializers::writeDescriptorSet(descriptorSet, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3, &mipmapLevelDescriptor));
+
 		vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSets.size()), writeDescriptorSets.data(), 0, nullptr);
 	}
 
